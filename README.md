@@ -66,9 +66,12 @@ Instead of options you can use ENVIRONMENT VARIABLES:
 
 #### Listing available S3 backups
 
-![backup](https://github.com/ivanpesin/sre-assignment/raw/main/list-backups.png)
+![list-backups](https://github.com/ivanpesin/sre-assignment/raw/main/list-backups.png)
 
 #### Restoring backup
+
+![restore](https://github.com/ivanpesin/sre-assignment/raw/main/restore.gif)
+> NOTE: this screencast uses local backup to make the recording shorter.
 
 ## Assignment assumptions and considerations
 
@@ -88,10 +91,13 @@ Instead of options you can use ENVIRONMENT VARIABLES:
 
 #### Backup/restore
 
-> NOTE: For 150G dataset, the only viable backup/restore option is raw backups. One can further enhance such setup with exporting logical dumps off a raw backup, include replicas, and so on. The assignment, however, **specifically** tells to produce separate logical backups for schema and data. Given the limited scope of the assignment, I decided to limit myself to only one type of backup, the one which is explicitly requested: **logical**.
-
 Let's consider available backup/restore options:
 
 - **hot vs cold backups**: there is nothing specified in the assignment, and if cold backups were acceptable, we'd just stop or flush and lock the DB and copy files. Then we can start the main instance back up, fire up another `mysqld` instance off backed up files and generate separate schema and data backups as required in the assignment. The script is not required to restore off SQL files specifically, so we can just restore off raw files achieving speed requirement. Smells like trickery, however, so I'm assuming we have to keep the main instance online during the backup.
 - **incremental backups**: this would reduce the amortized time of backing up, but usually complicates the recovery, which means slows it down. This directly contradicts the requirements (restore speed more important than backup speed), so crossing this out.
 - **raw vs logical backups**: For 150G dataset, the only viable backup/restore option is raw backups. One can further enhance such setup with exporting logical dumps off a raw backup, include replicas, and so on. The assignment, however, **specifically** tells to produce separate logical backups for schema and data. Given the limited scope of the assignment and the fact that raw hot backups are done best with snapshotting feature which I have already assumed not available, I decided to limit myself to only one type of backup, the one which is explicitly requested: **logical**. 
+
+Sticking with logical backup rules out the most popular backup suites for large MySQL instances: _Percona XtraBackup_ and _MySQL Enterprise Backup_. One of the reasons these tools are popular is that they are fast. The trouble with logical backups _and_ restores is that they are _slow_. The standard tool `mysqldump` does backing up and restoring in a single thread, so even if we have _fast_ storage, CPU, and RAM, it would still max out on a single core. However, the biggest problem is not the dumping performance, but rather the restore performance. It's even worse, because MySQL needs to rebuild the whole database off SQL statements. The assignment specifically emphasizes backup and restore _speed_, so we need to find a way to parallelize, or significantly improve single-threaded speed, or both!
+
+Standard logical backup/restore options are: `mysqldump`,`mysqlpump`, and quite recently `mysqlsh` with `dumpInstance()` and `loadDump()`. `mysqlpump` does backup in parallel, but the restore is still single-threaded. This again contradicts the requirements, so `mysqlpump` is out. `mysqlsh` actually looks  exactly like what the assignment looks for: it can parallelize both dumping and restoring, it compresses files, and produces schema and data files separately. Unfortunately, it is a fairly new utility and it does not support MySQL 5.6. Let's disqualify it, as it's not unreasonable to assume we don't want to use a new tool for such a critical task as backup handling. 
+
