@@ -43,9 +43,9 @@ usage() {
     cat <<EOF
 $SELF -- mysql backup/restore script.
 
-Usage: $SELF {-b|-r <id>} [optional parameters]
+USAGE: $SELF {-b|-r <id>|-l} [options]
 
-Parameters:
+OPTIONS:
 
 -- modes:
     -b          create a database backup
@@ -53,17 +53,23 @@ Parameters:
     -l          list backups available for restore
 -- aws:
     -a <file>   AWS credentials (if not configured)
-    -3 <s3 url> AWS S3 bucket URL. Empty URL disables upload.
+    -3 <s3 url> AWS S3 bucket URL. Empty URL disables upload
 -- backup/restore:
     -c <file>   my.cnf-style file with credentials specified
-                in [client] section. 
-    -r <num>    <num> rows per data chunkfile.
+                in [client] section (if not configured in my.cnf) 
+    -s <num>    <num> rows per data chunkfile
     -t <dir>    backup directory where dump files are stored      
 -- notifications:
-    -m <addr>   email address to send notifications to.
+    -m <addr>   email address to send notifications to
     -w <webhook> 
-                slack webhook URL.
+                slack webhook URL
 
+Instead of options you can use ENVIRONMENT VARIABLES:
+
+  S3_BUCKET         AWS S3 bucket URL
+  SLACK_WEBHOOK     slack webhook URL
+  MAIL_ADDR         email address to send notifications to
+  MYSQL_BACKUP_DIR  backup directory where dump files are stored
 EOF
 }
 
@@ -145,7 +151,7 @@ cleanup() {
 backup_progress() {
     
     local ppid=$1
-    local SLEEP=2
+    local SLEEP=${2:-2}
     local prev=""
 
     trap return HUP
@@ -153,11 +159,11 @@ backup_progress() {
     # while parent process exists
     while [ $ppid -eq $(ps -fp $BASHPID -o ppid=) ]; do
         # return if backup is completed:
-        [ ! -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" -a -d "$MYSQL_BACKUP_DIR/$BACKUP_TS" ] || return 
+        [ -d "$MYSQL_BACKUP_DIR/$BACKUP_TS" ] || return 
 
         local cur=$(ls -lt --block-size=M $MYSQL_BACKUP_DIR/$BACKUP_TS 2>/dev/null | \
               awk '/total/{t=$2}END{print "files:",NR-1,"size:",t}' || :)
-        [ "$cur" == "$prev" ] && return
+        #[ "$cur" == "$prev" ] && return
         log "[progress] $cur"
         prev=$cur
         sleep $SLEEP
@@ -283,12 +289,13 @@ restore() {
     # wait for data download to finish
     if [ ! -z "$s3pid" ]; then
         log "Waiting for data download to complete..."
-        local tarpid=$(ps --ppid=$s3pid -o pid=,comm= | awk '/tar/{print $1}')
-        pv -d $tarpid || :
+        backup_progress "$BASHPID" 5 &
+        pid=$!
         wait $s3pid || {
             err "Data download failed."
             exit $E_BACKUP
         }
+        kill -HUP $pid
     fi
 # test 2: restore data and check for errors
     log "[3/$PHASES] Restoring data ..."
@@ -367,7 +374,7 @@ flock -n 9 || {
 MODE=""
 MYSQL_CREDS=""
 # parse command line args
-while getopts "br:la:3:c:t:w:" opt; do
+while getopts "br:la:3:c:s:t:w:" opt; do
     case $opt in
         b) MODE="backup";;
         r) MODE="restore"; BACKUP_TS="$OPTARG";
@@ -380,7 +387,7 @@ while getopts "br:la:3:c:t:w:" opt; do
         a) [ -f "$OPTARG" ] && source "$OPTARG";;
         3) S3_BUCKET="$OPTARG";;
         c) MYSQL_CREDS="--defaults-file=$OPTARG";;
-        r) PART_ROWS=$OPTARG;;
+        s) PART_ROWS=$OPTARG;;
         t) MYSQL_BACKUP_DIR="$OPTARG";;
         w) SLACK_WEBHOOK="$OPTARG";;
         ?|:) usage; exit $E_SYNTAX;; 
