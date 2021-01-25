@@ -81,6 +81,17 @@ Instead of options you can use ENVIRONMENT VARIABLES:
 3. **CentOS8 linux environment**: the task does not specify Linux flavor; I'm assuming CentOS8 as this is a very common server distribution for production systems. This shouldn't affect the scripts and approach, but there might be differences in paths to system utilities used in the backup/restore scripts. Due to limited scope of this assignment, I'm ignoring SELinux configuration aspects.
 
 4. MySQL database is located on a filesystem/block device/volume that **does *NOT* support snapshots**, i.e. not on LVM/ZFS/EBS/etc. The reasons for this assumption: 
-   a. LVM/ZFS negatively impact MySQL performance; therefore many installations avoid such setup.
-   b. if the database is located on a volume which supports snapshots then doing a raw backup off the snapshot might be the most efficient way to backup and restore; such approach, however, seems to be in disagreement with the criteria listed in the assignment (backup data and scheme separately).
+   - LVM/ZFS negatively impact MySQL performance; therefore many installations avoid such setup.
+   - if the database is located on a volume which supports snapshots then doing a raw backup off the snapshot might be the most efficient way to backup and restore; such approach, however, seems to be in disagreement with the criteria listed in the assignment (backup data and scheme separately).
 
+### Considerations
+
+#### Backup/restore
+
+> NOTE: For 150G dataset, the only viable backup/restore option is raw backups. One can further enhance such setup with exporting logical dumps off a raw backup, include replicas, and so on. The assignment, however, **specifically** tells to produce separate logical backups for schema and data. Given the limited scope of the assignment, I decided to limit myself to only one type of backup, the one which is explicitly requested: **logical**.
+
+Let's consider available backup/restore options:
+
+- **hot vs cold backups**: there is nothing specified in the assignment, and if cold backups were acceptable, we'd just stop or flush and lock the DB and copy files. Then we can start the main instance back up, fire up another `mysqld` instance off backed up files and generate separate schema and data backups as required in the assignment. The script is not required to restore off SQL files specifically, so we can just restore off raw files achieving speed requirement. Smells like trickery, however, so I'm assuming we have to keep the main instance online during the backup.
+- **incremental backups**: this would reduce the amortized time of backing up, but usually complicates the recovery, which means slows it down. This directly contradicts the requirements (restore speed more important than backup speed), so crossing this out.
+- **raw vs logical backups**: For 150G dataset, the only viable backup/restore option is raw backups. One can further enhance such setup with exporting logical dumps off a raw backup, include replicas, and so on. The assignment, however, **specifically** tells to produce separate logical backups for schema and data. Given the limited scope of the assignment and the fact that raw hot backups are done best with snapshotting feature which I have already assumed not available, I decided to limit myself to only one type of backup, the one which is explicitly requested: **logical**. 
