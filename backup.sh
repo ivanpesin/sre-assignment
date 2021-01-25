@@ -11,7 +11,7 @@ PATH="/bin:/usr/bin:/usr/local/bin"
 # configuration variables
 NAME=$(realpath $0)
 SELF=$(basename $NAME)
-TOOLS="mysqldump mysqlimport aws curl mail mydumper myloader"
+TOOLS="aws curl mail mydumper myloader pv"
 LOCK_FILE="/var/run/$SELF.lock"
 
 BACKUP_TS=$(date -Is)
@@ -49,6 +49,7 @@ Parameters:
 -- modes:
     -b          create a database backup
     -r <id>     restore a database backup with ID <id>
+    -l          list backups available for restore
 -- aws:
     -a <file>   AWS credentials (if not configured)
     -3 <s3 url> AWS S3 bucket URL. Empty URL disables upload.
@@ -65,6 +66,7 @@ Parameters:
 EOF
 }
 
+# alert() sends notifications to selected slack and email address
 alert() {
     local MSG=$(echo $1 | sed 's#["\]#_#g') # quick and dirty sanitizing
     
@@ -80,9 +82,11 @@ alert() {
     fi
 }
 
+# logging functions; err is for critical errors, sends alerts automatically
 log() { echo "$(date -Is): $*"; }
 err() { echo "$(date -Is): ERR: $*" >&2; alert ":exclamation: $MODE $BACKUP_TS: ERROR: $*"; }
 
+# check_config() verifies access, tools, directories needed for operation
 check_config() {
     log "Checking backup/restore configuration ..."
     [[ -d "$MYSQL_BACKUP_DIR" && -w "$MYSQL_BACKUP_DIR" ]] || {
@@ -105,6 +109,7 @@ check_config() {
     # more checks here if/when necessary
 }
 
+# check_node() does basic sanity checks: free space, cpu load, swap, network connectivity
 check_node() {
     log "Checking the node vitals ..."
 
@@ -122,6 +127,7 @@ check_node() {
     # more checks here if necessary: cpu / swap / load ave / disk space / net connectivity
 }
 
+# cleanup() removes temporary files and spawned processes
 cleanup() {
     trap '' EXIT INT HUP
     log "Running cleanup..."
@@ -134,8 +140,8 @@ cleanup() {
     log "Cleanup done"
 }
 
+# this background function monitors backup directory and outputs stats
 backup_progress() {
-    # this background function provides process indication
     
     local ppid=$1
     local SLEEP=2
@@ -157,12 +163,13 @@ backup_progress() {
     done
 }
 
+# s3upload uploads backup to s3 bucket
 s3upload() {
     [ -z "$S3_BUCKET" ] && return # skipping upload if bucket is set to empty string
 
     log "[s3upload] Uploading $BACKUP_TS backup to $S3_BUCKET ..."
     log "[s3upload] Schema:"
-    tar cf - -C / $(echo "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" | sed 's#^/##') | pv | \
+    tar cf - -C "$MYSQL_BACKUP_DIR" "${BACKUP_TS}-schema" | pv | \
        aws s3 cp - "$S3_BUCKET/${BACKUP_TS}-schema.tar" && {
            rm -rf "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema"; 
        } || {
@@ -170,7 +177,7 @@ s3upload() {
        }
 
     log "[s3upload] Full:"
-    tar cf - -C / $(echo "$MYSQL_BACKUP_DIR/${BACKUP_TS}" | sed 's#^/##') | pv | \
+    tar cf - -C "$MYSQL_BACKUP_DIR" "${BACKUP_TS}" | pv | \
        aws s3 cp - "$S3_BUCKET/${BACKUP_TS}.tar" && {
            rm -rf "$MYSQL_BACKUP_DIR/${BACKUP_TS}"; 
        } || {
@@ -178,6 +185,8 @@ s3upload() {
        }
 }
 
+# backup() performs parallelized and compressed logical backup, and then separates 
+#          schema definition into separate directory for upload
 backup() {
     log "Backing up databases ..."
     backup_progress "$BASHPID" &
@@ -200,44 +209,120 @@ backup() {
     kill -HUP %1
     log "Backup completed."
     log "Creating schema archive ..."
-    mkdir $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema || { 
+    mkdir $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema && \
+      cp $MYSQL_BACKUP_DIR/$BACKUP_TS/metadata $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema && \
+      cp $MYSQL_BACKUP_DIR/$BACKUP_TS/*schema* $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema || {
+      # ^^^ might want to 'mv' instead, so that data restore does not recreate schema
         err "Failed to create schema backup directory"; 
         exit $E_BACKUP_DIR
     }
-    cp $MYSQL_BACKUP_DIR/$BACKUP_TS/*schema* $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema
+        
 
     s3upload
 }
 
-restore() {
-    log "Restoring from backup..."
+s3download() {
 
-    DIRS=""
-    if [ -z "$DATABASES" ]; then
-        DIRS=$(ls -1d $MYSQL_BACKUP_DIR/*)
-    else
-        for DB in $DATABASES; do
-            DIRS="$DIRS $MYSQL_BACKUP_DIR/$DB"
-        done
-    fi
+    [ -z "$S3_BUCKET" ] && return
 
-    for backup_dir in $DIRS; do
-        DB=$(basename $backup_dir)
-        log "Restoring database $DB..."
-
-        mysql -e 'drop database if exists '"$DB"'; create database '"$DB"';set global FOREIGN_KEY_CHECKS=0;'
-        
-        # restore schema
-        (echo "SET FOREIGN_KEY_CHECKS=0;"; cat $backup_dir/schema.sql) | mysql $MYSQL_CREDS $DB
-
-        # load data
-        mysqlimport $MYSQL_CREDS --use-threads=4 $DB $backup_dir/*.txt
-    done 
+    local fn=$1
+    
+    log "[s3download] Downloading $fn ..."
+    aws s3 cp $S3_BUCKET/$fn - | tar xf - -C "$MYSQL_BACKUP_DIR"  || :
+    log "[s3download] Downloaded: $fn"
 }
 
+# restore() performs schema restore and check, then data restore and check; after that
+#           it runs SQL queries to ensure data restoration correctness
+restore() {
+    local PHASES=5
+    local restore_log="$MYSQL_BACKUP_DIR/${BACKUP_TS}-restore.log"
+    local backup_log="$MYSQL_BACKUP_DIR/${BACKUP_TS}-backup.log"
+    local check_log="$MYSQL_BACKUP_DIR/${BACKUP_TS}-check.log"
+
+    log "Restoring $BACKUP_TS backup ..."
+
+    [ -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}" ] || s3download "${BACKUP_TS}.tar" &
+    [ -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" ] || s3download "${BACKUP_TS}-schema.tar"
+    
+# test 1: restore schema only and check for errors
+    log "[1/$PHASES] Restoring schema ..."
+    myloader $MYSQL_CREDS \
+        -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" \
+        -o -t $THR> "$restore_log" 2>&1 &
+    pid=$!
+
+    pv -d $pid && wait $pid || {
+        err "Failed to restore schema from ${BACKUP_TS} backup"
+        tail -10 "$restore_log" >&2
+        exit $E_BACKUP
+    }
+
+    log "[2/$PHASES] Checking schema: "
+    mysqlcheck $MYSQL_CREDS --all-databases > "$check_log" 2>&1 || {
+        err "Schema restored with issues. Last 10 lines of the log:"
+        tail -10 "$check_log" >&2
+        exit $E_BACKUP
+    }
+    log "Tables OK: $(awk '/OK$/{ok++}END{print ok "/" NR}' $check_log)"
+
+# test 2: restore data and check for errors
+    log "Waiting for data download to complete..."
+    wait # for s3download of data
+    log "[3/$PHASES] Restoring data ..."
+    echo "$(date -Is) --- Full restoration log ---" >> "$restore_log" 
+    myloader $MYSQL_CREDS \
+        -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}" \
+        -o -t $THR >> "$restore_log" 2>&1 &
+    pid=$!
+    pv -d $pid && wait $pid || {
+            err "Failed to restore data from ${BACKUP_TS} backup"
+            tail -10 "$restore_log" >&2
+            exit $E_BACKUP
+    }
+
+    log "[4/$PHASES] Checking data: "
+    mysqlcheck $MYSQL_CREDS --all-databases > "$check_log" 2>&1 || {
+        err "Data restored with issues. Last 10 lines of the log:"
+        tail -10 "$check_log" >&2
+        exit $E_BACKUP
+    }
+    log "Tables OK: $(awk '/OK$/{ok++}END{print ok "/" NR}' $check_log)"
+
+# test 3: check requiring knowledge of data, eg number of records in a table
+#         matches the number of assets in a directory, checksumming, etc 
+    log "[5/$PHASES] Data-specific integrity checks ... "
+
+    # ex: pick 3 random tables from the backup and make sure number of records match
+    local files=$(ls $MYSQL_BACKUP_DIR/${BACKUP_TS}/*.sql.gz | \
+        egrep -v '/mysql\.|schema-create|schema\.sql\.gz|[0-9]\.sql\.gz$' | \
+        shuf | tail -3)
+    for file in $files; do
+        local db_name=$(echo $file | sed 's#.*/##' | cut -d. -f1)
+        local tbl_name=$(echo $file | sed 's#.*/##' | cut -d. -f2)
+        local rcnt=$(zgrep -c '^(' $file)
+        
+        rcnt_actual=$(mysql $MYSQL_CREDS $db_name -NBe 'select count(*) from '"$tbl_name"';' || :)
+        [ ! -z "$rcnt_actual" ] || {
+            err "Failed to get row count for $db_name.$tbl_name"
+            exit $E_BACKUP
+        }
+
+        if [ $rcnt -eq $rcnt_actual ]; then
+            log "OK: $db_name.$tbl_name row counts match. Backup: $rcnt Actual: $rcnt_actual"
+        else
+            err "FAIL: $db_name.$tbl_name row counts differ! Backup: $rcnt Actual: $rcnt_actual"
+            exit $E_BACKUP
+        fi
+    done
+
+}
+
+# list() displays available S3 backups for restore
 list() {
     log "Retrieving available backups ..."
     local SCHEMAS=$(aws s3 ls "$S3_BUCKET" | grep 'schema.tar' || : )
+    # technically should check both schema and data archives are available
 
     [ -z "$SCHEMAS" ] && { log "No backups available"; return; }
     log "Available backup timestamps:"
@@ -260,10 +345,15 @@ flock -n 9 || {
 MODE=""
 MYSQL_CREDS=""
 # parse command line args
-while getopts ":brla:3:c:r:t:w:" opt; do
+while getopts "br:la:3:c:t:w:" opt; do
     case $opt in
         b) MODE="backup";;
-        r) MODE="restore"; BACKUP_TS="$OPTARG";;
+        r) MODE="restore"; BACKUP_TS="$OPTARG";
+           echo $BACKUP_TS | \
+            egrep -q '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' || {
+             err "Invalid backup timestamp specification: $BACKUP_TS"
+             exit $E_SYNTAX
+            };;
         l) MODE="list";;
         a) [ -f "$OPTARG" ] && source "$OPTARG";;
         3) S3_BUCKET="$OPTARG";;
@@ -271,7 +361,7 @@ while getopts ":brla:3:c:r:t:w:" opt; do
         r) PART_ROWS=$OPTARG;;
         t) MYSQL_BACKUP_DIR="$OPTARG";;
         w) SLACK_WEBHOOK="$OPTARG";;
-        ?) usage; exit $E_SYNTAX;; 
+        ?|:) usage; exit $E_SYNTAX;; 
     esac
 done
 
