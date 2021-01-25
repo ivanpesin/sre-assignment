@@ -101,3 +101,21 @@ Sticking with logical backup rules out the most popular backup suites for large 
 
 Standard logical backup/restore options are: `mysqldump`,`mysqlpump`, and quite recently `mysqlsh` with `dumpInstance()` and `loadDump()`. `mysqlpump` does backup in parallel, but the restore is still single-threaded. This again contradicts the requirements, so `mysqlpump` is out. `mysqlsh` actually looks  exactly like what the assignment looks for: it can parallelize both dumping and restoring, it compresses files, and produces schema and data files separately. Unfortunately, it is a fairly new utility and it does not support MySQL 5.6. Let's disqualify it, as it's not unreasonable to assume we don't want to use a new tool for such a critical task as backup handling. 
 
+TODO - finish
+
+### Other considerations
+
+`bash` seems perfectly suitable for this type of script, so I'll stick with it.
+
+For notifications I usually use [Apprise](https://github.com/caronc/apprise/wiki/CLI_Usage) which can send notifications to most notification services, including Slack, email, etc. Being a 3rd-party tool (although available in semi-standard EPEL repo), I wouldn't assume its availability and will implement Slack and email notifications using standard tools. I am assuming that sendmail/postfix is properly configured on the database node and that Slack API is accessible either directly or via proxy.
+
+I will use **S3** for backup storage, and will use tokens for authentication. Using S3 endpoint is possible without token authentication, but then it implies the DB node is on AWS. If the node were on AWS, then we'd have EBS for storage, and then we could've used EBS snapshotting for backup strategy, but we have ruled out this possibility earlier in the Assumptions. I also assume that security configuration/management such as access permissions, encription, etc is out of scope for this assignment.
+
+To account for speed requirement, the upload to S3 will be precompressed and parallelized (aws-cli version 2 parallelizes uploads and downloads for `cp` and `sync` commands).
+
+TODO: restore
+
+## Further thoughts
+
+TODO: size growth
+
