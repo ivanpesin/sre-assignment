@@ -16,11 +16,11 @@ LOCK_FILE="/var/run/$SELF.lock"
 
 BACKUP_TS=$(date -Is)
 TMP_DIR=$(mktemp -d)
-THR=$(grep -c processor /proc/cpuinfo)
+THR=$(grep -c processor /proc/cpuinfo) # Thread count for backup/restore
 
 MYSQL_DATA_DIR="${MYSQL_DATA_DIR:-/var/lib/mysql}" # default on rhel
 MYSQL_BACKUP_DIR="${MYSQL_BACKUP_DIR:-/var/lib/mysql-files}" # default dir with secure-file-priv
-PART_ROWS="200000"
+PART_ROWS="200000" # number of rows per data file, affects backup/restore performance
 
 SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
 MAIL_ADDR="${MAIL_ADDR:-}"
@@ -36,6 +36,7 @@ E_CMD_NOT_AVAIL=73
 E_MULTI_INSTANCE=74
 E_LOW_SPACE=75
 E_S3_ACCESS=76
+E_S3_FAILED=77
 
 # --- code
 usage() {
@@ -228,7 +229,7 @@ s3download() {
     local fn=$1
     
     log "[s3download] Downloading $fn ..."
-    aws s3 cp $S3_BUCKET/$fn - | tar xf - -C "$MYSQL_BACKUP_DIR"  || :
+    aws s3 cp $S3_BUCKET/$fn - | tar xf - -C "$MYSQL_BACKUP_DIR" || exit $E_S3_FAILED
     log "[s3download] Downloaded: $fn"
 }
 
@@ -242,8 +243,21 @@ restore() {
 
     log "Restoring $BACKUP_TS backup ..."
 
-    [ -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}" ] || s3download "${BACKUP_TS}.tar" &
-    [ -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" ] || s3download "${BACKUP_TS}-schema.tar"
+    local s3pid=""
+    # Download data backup in background to save time
+    if [ ! -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}" ]; then
+         s3download "${BACKUP_TS}.tar" &
+         s3pid=$!
+    fi
+
+    # Download schema backup
+    if [ ! -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" ]; then
+        s3download "${BACKUP_TS}-schema.tar" || {
+            err "Schema download failed."
+            exit $E_BACKUP
+        }
+    fi
+
     
 # test 1: restore schema only and check for errors
     log "[1/$PHASES] Restoring schema ..."
@@ -266,9 +280,17 @@ restore() {
     }
     log "Tables OK: $(awk '/OK$/{ok++}END{print ok "/" NR}' $check_log)"
 
+    # wait for data download to finish
+    if [ ! -z "$s3pid" ]; then
+        log "Waiting for data download to complete..."
+        local tarpid=$(ps --ppid=$s3pid -o pid=,comm= | awk '/tar/{print $1}')
+        pv -d $tarpid || :
+        wait $s3pid || {
+            err "Data download failed."
+            exit $E_BACKUP
+        }
+    fi
 # test 2: restore data and check for errors
-    log "Waiting for data download to complete..."
-    wait # for s3download of data
     log "[3/$PHASES] Restoring data ..."
     echo "$(date -Is) --- Full restoration log ---" >> "$restore_log" 
     myloader $MYSQL_CREDS \
@@ -295,7 +317,7 @@ restore() {
 
     # ex: pick 3 random tables from the backup and make sure number of records match
     local files=$(ls $MYSQL_BACKUP_DIR/${BACKUP_TS}/*.sql.gz | \
-        egrep -v '/mysql\.|schema-create|schema\.sql\.gz|[0-9]\.sql\.gz$' | \
+        egrep -v '/mysql\.|-schema-|schema\.sql\.gz|[0-9]\.sql\.gz$' | \
         shuf | tail -3)
     for file in $files; do
         local db_name=$(echo $file | sed 's#.*/##' | cut -d. -f1)
