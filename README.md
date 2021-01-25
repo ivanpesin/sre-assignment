@@ -54,4 +54,16 @@ Instead of options you can use ENVIRONMENT VARIABLES:
   MYSQL_BACKUP_DIR  backup directory where dump files are stored
 ```
 
+> NOTE: the user running the script _MUST_ have read access to MySQL data directory; this is for the script to make estimation of free space required for the backup.
+
 ### Operation screencasts
+
+>NOTE: In the below screencasts, MySQL credentials are specified in `[client]` section of `~/.my.cnf`, **aws-cli** is configured, and slack/email notification destinations are specified via _environment variables_.
+
+#### Creating a backup
+
+![backup](https://github.com/ivanpesin/sre-assignment/raw/main/backup.gif)
+
+#### Listing available S3 backups
+
+![backup](https://github.com/ivanpesin/sre-assignment/raw/main/list-backups.png)
