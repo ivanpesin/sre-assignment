@@ -11,20 +11,20 @@ PATH="/bin:/usr/bin:/usr/local/bin"
 # configuration variables
 NAME=$(realpath $0)
 SELF=$(basename $NAME)
-ID=$(date -Is)
+TOOLS="mysqldump mysqlimport aws curl mail mydumper myloader"
+LOCK_FILE="/var/run/$SELF.lock"
 
-MYSQL_UID=$(getent passwd mysql | cut -d: -f3)
+BACKUP_TS=$(date -Is)
+TMP_DIR=$(mktemp -d)
+THR=$(grep -c processor /proc/cpuinfo)
+
 MYSQL_DATA_DIR="${MYSQL_DATA_DIR:-/var/lib/mysql}" # default on rhel
 MYSQL_BACKUP_DIR="${MYSQL_BACKUP_DIR:-/var/lib/mysql-files}" # default dir with secure-file-priv
+PART_ROWS="200000"
 
 SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
 MAIL_ADDR="${MAIL_ADDR:-}"
 S3_BUCKET="${S3_BUCKET:-s3://database-backup}"
-
-TOOLS="mysqldump mysqlimport aws curl mail mydumper myloader"
-LOCK_FILE="/var/run/$SELF.lock"
-
-TMP_DIR=$(mktemp -d)
 
 # Error codes for abnormal exit.
 E_SYNTAX=1
@@ -51,12 +51,11 @@ Parameters:
     -r <id>     restore a database backup with ID <id>
 -- aws:
     -a <file>   AWS credentials (if not configured)
-    -3 <s3 url> AWS S3 bucket URL
+    -3 <s3 url> AWS S3 bucket URL. Empty URL disables upload.
 -- backup/restore:
     -c <file>   my.cnf-style file with credentials specified
-                in [mysql], [mysqldump], and [mysqlimport] sections. 
-    -d <db1,db2,...>
-                comma separated list of DBs to backup/restore; optional.
+                in [client] section. 
+    -r <num>    <num> rows per data chunkfile.
     -t <dir>    backup directory where dump files are stored      
 -- notifications:
     -m <addr>   email address to send notifications to.
@@ -82,14 +81,10 @@ alert() {
 }
 
 log() { echo "$(date -Is): $*"; }
-err() { echo "$(date -Is): ERR: $*" >&2; alert ":exclamation: $MODE $ID: ERROR: $*"; }
+err() { echo "$(date -Is): ERR: $*" >&2; alert ":exclamation: $MODE $BACKUP_TS: ERROR: $*"; }
 
 check_config() {
-    log "Checking backup/restore configuration..."
-    [[ "$UID" == "$MYSQL_UID" ]] || {
-        err "Script is not running as mysql user, uid $UID != mysql uid $MYSQL_UID"
-        exit $E_USER
-    }
+    log "Checking backup/restore configuration ..."
     [[ -d "$MYSQL_BACKUP_DIR" && -w "$MYSQL_BACKUP_DIR" ]] || {
         err "Backup directory does not exist or isn't writable: $MYSQL_BACKUP_DIR"
         exit $E_BACKUP_DIR
@@ -101,7 +96,7 @@ check_config() {
         }
     done
 
-    if [ ! -z "$S3_BUCKET"]; then
+    if [ ! -z "$S3_BUCKET" ]; then
         aws s3 ls "$S3_BUCKET" >/dev/null || {
             err "Unable to access S3 bucket"
             exit $E_S3_ACCESS
@@ -111,7 +106,7 @@ check_config() {
 }
 
 check_node() {
-    log "Checking the node vitals..."
+    log "Checking the node vitals ..."
 
     local DB_SIZE=$(du -s ${MYSQL_DATA_DIR}/ | awk '{print $1}')
     local FREE_SPACE=$(df -P ${MYSQL_BACKUP_DIR}/ | awk 'NR==2{print $4}')
@@ -140,96 +135,78 @@ cleanup() {
 }
 
 backup_progress() {
-    local DB=$1
+    # this background function provides process indication
+    
+    local ppid=$1
     local SLEEP=2
-    local STATE="$TMP_DIR/backup_progress.$DB"
+    local prev=""
 
-    rm -f "${STATE}*"
+    trap return HUP
+    sleep $SLEEP
+    # while parent process exists
+    while [ $ppid -eq $(ps -fp $BASHPID -o ppid=) ]; do
+        # return if backup is completed:
+        [ ! -d "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" -a -d "$MYSQL_BACKUP_DIR/$BACKUP_TS" ] || return 
 
-    until [ -f "${STATE}.done" -o ! -d "$MYSQL_BACKUP_DIR/$DB" ]; do
+        local cur=$(ls -lt --block-size=M $MYSQL_BACKUP_DIR/$BACKUP_TS 2>/dev/null | \
+              awk '/total/{t=$2}END{print "files:",NR-1,"size:",t}' || :)
+        [ "$cur" == "$prev" ] && return
+        log "[progress] $cur"
+        prev=$cur
         sleep $SLEEP
-        ls -l --block-size=M $MYSQL_BACKUP_DIR/$DB 2>/dev/null | \
-            awk '!/^total/&&NF==9{print $9,"size:",$5}' > "${STATE}.new" || :
-        if [ -f "$STATE" ]; then
-            DIFF=$(diff -u "$STATE" "${STATE}.new" || :)
-            if [ -z "$DIFF" ]; then
-                touch "${STATE}.done"
-            else
-                log "[progress] $(echo "$DIFF" | grep '^+[^+]')"
-            fi 
-        fi
-        cp -f ${STATE}.new ${STATE}
     done
 }
 
 s3upload() {
-    local DB=$1
     [ -z "$S3_BUCKET" ] && return # skipping upload if bucket is set to empty string
 
-    log "[s3upload] Uploading $DB data to $S3_BUCKET..."
-    tar cjf - -C / $(echo "$MYSQL_BACKUP_DIR/$DB" | sed 's#^/##') | \
-       aws s3 cp - "$S3_BUCKET/$DB-$ID.tbz2" && {
-           log "[s3upload] Uploaded $DB to $S3_BUCKET"
-           rm -rf "$MYSQL_BACKUP_DIR/$DB"; 
+    log "[s3upload] Uploading $BACKUP_TS backup to $S3_BUCKET ..."
+    log "[s3upload] Schema:"
+    tar cf - -C / $(echo "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema" | sed 's#^/##') | pv | \
+       aws s3 cp - "$S3_BUCKET/${BACKUP_TS}-schema.tar" && {
+           rm -rf "$MYSQL_BACKUP_DIR/${BACKUP_TS}-schema"; 
        } || {
-           err "[s3upload] Failed to upload $DB backup to $S3_BUCKET; leaving backup on disk."
+           err "[s3upload] Failed to upload schema backup to $S3_BUCKET; leaving it on disk."
+       }
+
+    log "[s3upload] Full:"
+    tar cf - -C / $(echo "$MYSQL_BACKUP_DIR/${BACKUP_TS}" | sed 's#^/##') | pv | \
+       aws s3 cp - "$S3_BUCKET/${BACKUP_TS}.tar" && {
+           rm -rf "$MYSQL_BACKUP_DIR/${BACKUP_TS}"; 
+       } || {
+           err "[s3upload] Failed to upload full backup to $S3_BUCKET; leaving it on disk."
        }
 }
 
 backup() {
-    
-    if [ -z "$DATABASES" ]; then
-        # get list of DBs to backup; creds from my.cnf or specified with -c
-        DATABASES=$(mysql $MYSQL_CREDS -NBe 'show databases;' | \
-          egrep -v 'sys|information_schema|performance_schema' || : )
-    
-        [ ! -z "$DATABASES" ] || {
-            err "Unable to retrieve list of databases"
-            exit $E_BACKUP
-        }
-    fi
+    log "Backing up databases ..."
+    backup_progress "$BASHPID" &
 
-    log "DBs to backup: $DATABASES"
-
-    for DB in $DATABASES; do
-    #    [ -z "$DB" ] && continue # could be stay empty line
-
-        mkdir $MYSQL_BACKUP_DIR/$DB || {
-            err "Failed to create $MYSQL_BACKUP_DIR/$DB"
-            exit $E_BACKUP
-        }
-
-        log "Backing up $DB ..."
-        backup_progress $DB &
-
-        
-        mysqldump $MYSQL_CREDS \
-            --no-data \
-            --max_allowed_packet=128M \
-            --single-transaction \
-            --result-file $MYSQL_BACKUP_DIR/$DB/schema.sql \
-            $DB > "$TMP_DIR/$DB.log" 2>&1 || {
-                err "Backup of $DB failed. Full log is available at: $TMP_DIR/$DB.log"
+    mydumper $MYSQL_CREDS \
+        -o $MYSQL_BACKUP_DIR/$BACKUP_TS \
+        -r $PART_ROWS \
+        -t $THR \
+        --compress \
+        --regex '^(?!(sys\.|information_schema\.|performance_schema\.))' \
+        --trx-consistency-only \
+        --triggers --events --routines \
+        --compress \
+        -L "$TMP_DIR/backup.log" || { 
+                err "Backup failed. Full log is available at: $TMP_DIR/backup.log"
                 err "Last 10 lines of the log:"
-                err "$(tail -10 $TMP_DIR/$DB.log)"
+                tail -10 "$TMP_DIR/backup.log" >&2
                 exit $E_BACKUP
-            }
+        }
+    kill -HUP %1
+    log "Backup completed."
+    log "Creating schema archive ..."
+    mkdir $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema || { 
+        err "Failed to create schema backup directory"; 
+        exit $E_BACKUP_DIR
+    }
+    cp $MYSQL_BACKUP_DIR/$BACKUP_TS/*schema* $MYSQL_BACKUP_DIR/${BACKUP_TS}-schema
 
-        mysqldump $MYSQL_CREDS \
-            --no-create-info  \
-            --max_allowed_packet=128M \
-            --tab $MYSQL_BACKUP_DIR/$DB \
-            --single-transaction \
-            $DB > "$TMP_DIR/$DB.log" 2>&1 || {
-                err "Backup of $DB failed. Full log is available at: $TMP_DIR/$DB.log"
-                err "Last 10 lines of the log:"
-                err "$(tail -10 $TMP_DIR/$DB.log)"
-                exit $E_BACKUP
-            }
-        
-        log "$DB: done, tables: $(ls $MYSQL_BACKUP_DIR/$DB/*.txt | wc -l)"
-        s3upload $DB &
-    done
+    s3upload
 }
 
 restore() {
@@ -258,6 +235,19 @@ restore() {
     done 
 }
 
+list() {
+    log "Retrieving available backups ..."
+    local SCHEMAS=$(aws s3 ls "$S3_BUCKET" | grep 'schema.tar' || : )
+
+    [ -z "$SCHEMAS" ] && { log "No backups available"; return; }
+    log "Available backup timestamps:"
+    echo "$SCHEMAS" | awk '{print ">", $4}' | \
+        sed 's#-schema.tar##' | while read line; do
+            log $line
+        done
+    log "Restore with: $SELF -r <backup timestamp>"
+}
+
 # --- main
 
 # ensure only single instance of script is running
@@ -270,14 +260,15 @@ flock -n 9 || {
 MODE=""
 MYSQL_CREDS=""
 # parse command line args
-while getopts ":bra:3:c:d:t:w:" opt; do
+while getopts ":brla:3:c:r:t:w:" opt; do
     case $opt in
         b) MODE="backup";;
-        r) MODE="restore"; ID="$OPTARG";;
+        r) MODE="restore"; BACKUP_TS="$OPTARG";;
+        l) MODE="list";;
         a) [ -f "$OPTARG" ] && source "$OPTARG";;
         3) S3_BUCKET="$OPTARG";;
-        c) MYSQL_CREDS="--defaults-extra-file=$OPTARG";;
-        d) DATABASES=$(echo $OPTARG | sed 's#,# #g');;
+        c) MYSQL_CREDS="--defaults-file=$OPTARG";;
+        r) PART_ROWS=$OPTARG;;
         t) MYSQL_BACKUP_DIR="$OPTARG";;
         w) SLACK_WEBHOOK="$OPTARG";;
         ?) usage; exit $E_SYNTAX;; 
@@ -293,11 +284,11 @@ trap cleanup INT HUP EXIT
 check_config
 check_node
 
-if [ $MODE == "backup" ]; then
-    backup
-    wait
-else
-    restore
-fi
+case $MODE in
+    backup) backup;;
+    restore) restore;;
+    list) list; exit 0;; # avoid notifications
+    *) usage; exit $E_SYNTAX;;
+esac
 
-alert "$MODE $ID completed."
+alert "$MODE $BACKUP_TS completed."
