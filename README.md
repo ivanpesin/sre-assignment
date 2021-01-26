@@ -2,6 +2,21 @@
 
 > For the assignment description, please refer to `SRE_practical_task.pdf`.
 
+- [SRE test assignment](#sre-test-assignment)
+  - [Operational documentation](#operational-documentation)
+    - [Summary](#summary)
+    - [Usage](#usage)
+    - [Operation screencasts](#operation-screencasts)
+      - [Creating a backup](#creating-a-backup)
+      - [Listing available S3 backups](#listing-available-s3-backups)
+      - [Restoring backup](#restoring-backup)
+  - [Assignment assumptions and considerations](#assignment-assumptions-and-considerations)
+    - [Assumptions](#assumptions)
+    - [Considerations](#considerations)
+      - [Backup/restore](#backuprestore)
+    - [Other considerations](#other-considerations)
+  - [Further thoughts](#further-thoughts)
+
 ## Operational documentation
 
 ### Summary
