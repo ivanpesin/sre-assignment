@@ -9,7 +9,7 @@
 `backup.sh` is a backup/restore script for large MySQL instances with following characteristics:
 
 - process progress is logged to `stdout`
-- errors are handles and logged to `stderr`
+- errors are handled and logged to `stderr`
 - critical errors are reported via following notification channels: _slack_ and _email_
 - backup and restore procedures are parallelized to improve performance
 - data and schema are backed up separately
@@ -101,7 +101,19 @@ Sticking with logical backup rules out the most popular backup suites for large 
 
 Standard logical backup/restore options are: `mysqldump`,`mysqlpump`, and quite recently `mysqlsh` with `dumpInstance()` and `loadDump()`. `mysqlpump` does backup in parallel, but the restore is still single-threaded. This again contradicts the requirements, so `mysqlpump` is out. `mysqlsh` actually looks  exactly like what the assignment looks for: it can parallelize both dumping and restoring, it compresses files, and produces schema and data files separately. Unfortunately, it is a fairly new utility and it does not support MySQL 5.6. Let's disqualify it, as it's not unreasonable to assume we don't want to use a new tool for such a critical task as backup handling. 
 
-TODO - finish
+This leaves as with a venerable `mysqldump`, and a 3rd party `mydumper/myloader`. We can speed up `mysqldump` performance by using its TSV mode; this  also should improve the restore speed, as it's going to use `LOAD DATA` statements (`mysqlimport` wrapper). This approach, however, requires splitting data files and then carefully managing parallelism (read: more code and time to implement)to really achieve significant performance improvement. On the other hand, `mydumper/myloader` has long been around, proven in production environments, and provides parallelism boost right out of the box.
+
+Here is some performance data for backup/restore methods considered:
+
+![dump](https://mysqlserverteam.com/wp-content/uploads/2020/07/dump-1.png)
+
+![restore](https://mysqlserverteam.com/wp-content/uploads/2020/07/load-1.png)
+
+> source: [MySQL Server Blog](https://mysqlserverteam.com/mysql-shell-dump-load-part-2-benchmarks/)
+
+As evidenced above, `mydumper` is way more performant than `mysqldump`/`mysqlpump`, trailing behind `mysqlsh`. [Percona test](https://www.percona.com/blog/2018/02/22/restore-mysql-logical-backup-maximum-speed/) also suggest that `mydumper` performance on backup/restore with default parameters is similar to highly optimized `mysqldump --tab/mysqlimport` approach.
+
+Thus, for this assignment I am going to use `mydumper/myloader` as the backup tool.
 
 ### Other considerations
 
@@ -109,13 +121,54 @@ TODO - finish
 
 For notifications I usually use [Apprise](https://github.com/caronc/apprise/wiki/CLI_Usage) which can send notifications to most notification services, including Slack, email, etc. Being a 3rd-party tool (although available in semi-standard EPEL repo), I wouldn't assume its availability and will implement Slack and email notifications using standard tools. I am assuming that sendmail/postfix is properly configured on the database node and that Slack API is accessible either directly or via proxy.
 
-I will use **S3** for backup storage, and will use tokens for authentication. Using S3 endpoint is possible without token authentication, but then it implies the DB node is on AWS. If the node were on AWS, then we'd have EBS for storage, and then we could've used EBS snapshotting for backup strategy, but we have ruled out this possibility earlier in the Assumptions. I also assume that security configuration/management such as access permissions, encription, etc is out of scope for this assignment.
+I will use **S3** for backup storage, and will use tokens for authentication. Using S3 endpoint is possible without token authentication, but then it implies the DB node is on AWS. If the node were on AWS, then we'd have EBS for storage, and then we could've used EBS snapshotting for backup strategy, but we have ruled out this possibility earlier in the Assumptions. I also assume that security configuration/management such as access permissions, encryption, etc is out of scope for this assignment.
 
 To account for speed requirement, the upload to S3 will be precompressed and parallelized (aws-cli version 2 parallelizes uploads and downloads for `cp` and `sync` commands).
 
-TODO: restore
+Restore tests are a complex subject and can be implemented in a multitude of ways. Here is the strategy I'll implement:
+
+1. To ensure consistent restore process, we need to start with backups. As we only use transactional InnoDB tables, the backup procedure will use transactional consistency approach.
+2. Import schema from the backup. Schemas are relatively small, so the import will be quick and will pick up most corruptions in the backup schema files.
+3. Run `mysqlcheck` to check all database tables for the corruption after backup import.
+4. Import the data. This stage will pick up most corruptions in the backup data files.
+5. Re-run `mysqlcheck` to check all database tables for the corruption after backup import.
+6. Pick 3 random tables from the backup and compare record counts in database and backup files.
+
+There are other important checks that I have not implemented due to limited scope and time, but including here for reference: 
+- table checksumming before/during the backup; this will allow checksum validation after backup restore
+- database backup after restore and comparison to the source backup; they should be identical
+- content checks which require knowledge of data in the database. For example, if a database table contains metadata about the files on disk storage, we can run the query to ensure that all records reference existing files, or that all files in storage have an entry in the database.
+
+For script testing I'm going to use the following datasets: Sakila, Employee, and some large tables from Wiki dumps.
 
 ## Further thoughts
 
-TODO: size growth
+As I mentioned before, the first thing to improve with this backup approach is to move to raw backups as a primary technique. This will greatly improve both backup and restore speed. I'd use _Percona XtraBackup_ for this.
+
+Then, adding the read-only replica would allow more flexibility in terms of how and where to backup: shift backup performance impact from the master to slave nodes, speed up recovery in certain situations by promoting slave instead of restore, etc.
+
+The next step would be putting the database on a block device or filesystem that supports snapshotting. This would further improve backup capabilities in terms of performance and consistency.
+
+All these steps permit fulfilling existing requirements of backing up schema/data separately and perform recovery testing while improving backup/recovery capabilities. For example, one strategy might be as follows:
+
+* Backup:
+  - perform hot raw backup with _Percona XtraBackup_ 
+  - start second _mysqld_ instance off the backup files
+  - run healthchecks/consistency checks to ensure the copy is valid
+  - perform `mysqldump` off second instance to backup data and schema separately
+  - upload compressed backups (both raw and logical) and checksum file to cloud storage
+  - keep N backups locally for faster recovery
+- Restore testing:
+  - download backups from cloud if not cached locally
+  - verify downloaded files for corruption with checksums
+  - restore schema, check tables for corruption
+  - restore data, check tables for corruption
+  - run data-aware checks (query table row counts, table checksums, data validation)
+  - perform `mysqldump` off restored instance similar to how it was done during backup. Files produced should be exactly match logical backup files from which instance was restored
+  - repeat testing for raw backup: restore, check tables for corruption, run data-aware checks, `mysqldump`
+- Restore:
+  - download raw backup from cloud if not cached locally
+  - verify downloaded files for corruption with checksums
+  - restore database
+
 
