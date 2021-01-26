@@ -14,7 +14,7 @@
     - [Assumptions](#assumptions)
     - [Considerations](#considerations)
       - [Backup/restore](#backuprestore)
-    - [Other considerations](#other-considerations)
+      - [Other considerations](#other-considerations)
   - [Further thoughts](#further-thoughts)
 
 ## Operational documentation
@@ -130,7 +130,7 @@ As evidenced above, `mydumper` is way more performant than `mysqldump`/`mysqlpum
 
 Thus, for this assignment I am going to use `mydumper/myloader` as the backup tool.
 
-### Other considerations
+#### Other considerations
 
 `bash` seems perfectly suitable for this type of script, so I'll stick with it.
 
