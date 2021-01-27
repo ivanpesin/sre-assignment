@@ -99,7 +99,7 @@ Instead of options you can use ENVIRONMENT VARIABLES:
 3. **CentOS8 linux environment**: the task does not specify Linux flavor; I'm assuming CentOS8 as this is a very common server distribution for production systems. This shouldn't affect the scripts and approach, but there might be differences in paths to system utilities used in the backup/restore scripts. Due to limited scope of this assignment, I'm ignoring SELinux configuration aspects.
 
 4. MySQL database is located on a filesystem/block device/volume that **does *NOT* support snapshots**, i.e. not on LVM/ZFS/EBS/etc. The reasons for this assumption: 
-   - LVM/ZFS negatively impact MySQL performance; therefore many installations avoid such setup.
+   - LVM/ZFS negatively impact MySQL performance (see for example [percona blog on ZFS](https://www.percona.com/blog/2018/02/16/why-zfs-affects-mysql-performance/); therefore many installations avoid such setup.
    - if the database is located on a volume which supports snapshots then doing a raw backup off the snapshot might be the most efficient way to backup and restore; such approach, however, seems to be in disagreement with the criteria listed in the assignment (backup data and scheme separately).
 
 ### Considerations
@@ -138,7 +138,7 @@ For notifications I usually use [Apprise](https://github.com/caronc/apprise/wiki
 
 I will use **S3** for backup storage, and will use tokens for authentication. Using S3 endpoint is possible without token authentication, but then it implies the DB node is on AWS. If the node were on AWS, then we'd have EBS for storage, and then we could've used EBS snapshotting for backup strategy, but we have ruled out this possibility earlier in the Assumptions. I also assume that security configuration/management such as access permissions, encryption, etc is out of scope for this assignment.
 
-To account for speed requirement, the upload to S3 will be precompressed and parallelized (aws-cli version 2 parallelizes uploads and downloads for `cp` and `sync` commands).
+To account for speed requirement, the upload to S3 will be precompressed and parallelized (aws-cli version 2 parallelizes uploads and downloads for `cp` and `sync` commands. See [this AWS post](https://aws.amazon.com/blogs/apn/getting-the-most-out-of-the-amazon-s3-cli/): "if the files are over a certain size, the AWS CLI automatically breaks the files into smaller parts and uploads them in parallel".)
 
 Restore tests are a complex subject and can be implemented in a multitude of ways. Here is the strategy I'll implement:
 
